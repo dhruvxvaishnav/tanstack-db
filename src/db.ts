@@ -5,6 +5,7 @@ import { BasicIndex, type Collection } from "@tanstack/db"
 import type { QueryClient } from "@tanstack/query-core"
 import { queryCollectionOptions } from "@tanstack/query-db-collection"
 import {
+  DEFAULT_PAGE_SIZE,
   subsetOptionsToQueryKey,
   supabaseOnDelete,
   supabaseOnInsert,
@@ -21,6 +22,8 @@ interface SupabaseCollectionOptions<TSchema extends StandardSchemaV1> {
    * update and delete operations.
    */
   keys: Array<keyof StandardSchemaV1.InferOutput<TSchema> & string>
+  /** Maximum number of rows requested from PostgREST at a time. Must be a positive integer. */
+  pageSize?: number
   /** The query client */
   queryClient?: QueryClient
   /** Whether to receive updates when a record has been inserted, updated, or deleted by another user */
@@ -69,7 +72,6 @@ const registerTable = (
   realtimeUseFilter: boolean
 ): TableEntry => {
   ensureQueryCacheSubscription(queryClient)
-  // biome-ignore lint/style/noNonNullAssertion: <explanation>
   const tables = queryClientRegistries.get(queryClient)!
 
   if (!tables.has(tableName)) {
@@ -85,13 +87,13 @@ const registerTable = (
     })
   }
 
-  // biome-ignore lint/style/noNonNullAssertion: <explanation>
   return tables.get(tableName)!
 }
 
 export const supabaseCollectionOptions = <TSchema extends StandardSchemaV1>({
   tableName,
   keys,
+  pageSize: requestedPageSize,
   schema,
   queryClient,
   supabase,
@@ -100,6 +102,13 @@ export const supabaseCollectionOptions = <TSchema extends StandardSchemaV1>({
 }: SupabaseCollectionOptions<TSchema>) => {
   // if the query client is not provided, use the global query client
   queryClient = queryClient ?? getQueryClient()
+
+  // Fail at construction rather than inside the first fetch, where TanStack
+  // Query would retry the error and leave an empty but "ready" collection.
+  const pageSize = requestedPageSize ?? DEFAULT_PAGE_SIZE
+  if (!Number.isSafeInteger(pageSize) || pageSize <= 0) {
+    throw new Error(`pageSize must be a positive integer, received ${pageSize}`)
+  }
 
   type TItem = StandardSchemaV1.InferOutput<TSchema>
 
@@ -133,7 +142,8 @@ export const supabaseCollectionOptions = <TSchema extends StandardSchemaV1>({
     // published. Gating the fetch on the subscription closes this gap but couples
     // every first load to Realtime connect latency, so it is intentionally left
     // out and tracked separately.
-    queryFn: (ctx) => supabaseQueryFn(supabase, tableName, ctx),
+    queryFn: (ctx) =>
+      supabaseQueryFn(supabase, tableName, keyColumns, ctx, pageSize),
     onInsert: (ctx) => supabaseOnInsert(supabase, tableName, ctx),
     onUpdate: (ctx) => supabaseOnUpdate(supabase, tableName, keyColumns, ctx),
     onDelete: (ctx) => supabaseOnDelete(supabase, tableName, keyColumns, ctx),
