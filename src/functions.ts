@@ -7,6 +7,8 @@ import {
 } from "@tanstack/db"
 import type { QueryClient, QueryMeta } from "@tanstack/query-core"
 import {
+  cursorCurrentToSearch,
+  cursorWhereFromToSearch,
   keyColumnsToSearch,
   loadSubsetOptionsToSearch,
   subsetParamsToSearch,
@@ -19,10 +21,34 @@ export const subsetOptionsToQueryKey = (
   ctx: LoadSubsetOptions
 ): Array<string> => {
   // The key shares the request URL's where/order/limit encoding
-  // (`subsetParamsToSearch`) so the two cannot drift. Pagination params
-  // (cursor/offset) and the constant `select` are intentionally excluded:
-  // pages of one subset must share a cache key.
-  const key = subsetParamsToSearch(ctx).toString()
+  // (`subsetParamsToSearch`) so the two cannot drift; the constant `select` is
+  // excluded because it never distinguishes one subset from another.
+  //
+  // Pagination params (cursor/offset) ARE included: query-db-collection keys row
+  // ownership by this key, so distinct windows of the same subset (same
+  // where/order/limit, different cursor/offset) must not collide — otherwise a
+  // later page's result would take over the earlier page's rows and delete them.
+  // The key still starts with `[tableName]` so `syncTableSubscription` keeps
+  // matching every window of the table by prefix.
+  const search = subsetParamsToSearch(ctx)
+  if (ctx.cursor) {
+    try {
+      for (const [k, v] of cursorWhereFromToSearch(ctx.cursor)) {
+        search.append(k, v)
+      }
+    } catch {
+      // The queryKey function must never throw — query-db-collection calls it
+      // synchronously to key row ownership. If the cursor cannot be rendered
+      // (an un-pushable predicate), fall back to a deterministic discriminator
+      // so distinct windows still get distinct keys and cannot take over and
+      // delete each other's rows.
+      search.append("cursor", JSON.stringify(ctx.cursor.whereFrom))
+    }
+  }
+  if (ctx.offset && !ctx.cursor) {
+    search.append("offset", `${ctx.offset}`)
+  }
+  const key = search.toString()
   return key ? [tableName, key] : [tableName]
 }
 
@@ -38,12 +64,39 @@ export const supabaseQueryFn = async (
     direction?: unknown
   }
 ) => {
-  const search = loadSubsetOptionsToSearch(ctx.meta?.loadSubsetOptions ?? {})
-  const data = await postgrestRequest(supabase, tableName, {
-    method: "GET",
-    search,
-  })
-  return data || []
+  const options = ctx.meta?.loadSubsetOptions ?? {}
+  const search = loadSubsetOptionsToSearch(options)
+
+  // A keyset request whose boundary column has ties (e.g. `orderBy(created_at)`
+  // with repeated values) needs a second, unlimited request for the rows equal
+  // to the boundary; the limited `whereFrom` page alone would skip them.
+  //
+  // Do not drop this on the grounds that core's ordered-source loader also
+  // probes the boundary (`requestSnapshot({ where: eq(col, boundary) })`) and
+  // usually pre-loads the same tie class: that probe is a window-path
+  // optimization the adapter cannot assume ran. It is skipped when the boundary
+  // value is unchanged, falls back to a full-source load for non-keyset orders,
+  // and never runs for `loadSubset({ cursor })` calls made outside that path.
+  // Honouring `whereCurrent` here is what makes the cursor correct on its own.
+  const tiesSearch = cursorCurrentToSearch(options)
+  if (!tiesSearch) {
+    const data = await postgrestRequest(supabase, tableName, {
+      method: "GET",
+      search,
+    })
+    return data || []
+  }
+
+  const [ties, rows] = await Promise.all([
+    postgrestRequest(supabase, tableName, {
+      method: "GET",
+      search: tiesSearch,
+    }),
+    postgrestRequest(supabase, tableName, { method: "GET", search }),
+  ])
+  // `whereCurrent` (== boundary) and `whereFrom` (> / < boundary) are disjoint,
+  // so concatenation never duplicates; the collection re-sorts locally.
+  return [...(ties || []), ...(rows || [])]
 }
 
 export const supabaseOnInsert = async (
