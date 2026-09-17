@@ -1,15 +1,8 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js"
 import { eq, IR, type LoadSubsetOptions } from "@tanstack/db"
-import { QueryClient } from "@tanstack/query-core"
 import { describe, expect, test, vi } from "vitest"
 import { supabaseQueryFn } from "../src/functions"
-import { supabaseCollectionOptions } from "../src/index"
-import {
-  normalizeFetchUrl,
-  SUPABASE_KEY,
-  SUPABASE_URL,
-  usersSchema,
-} from "./test.utils"
+import { normalizeFetchUrl, SUPABASE_KEY, SUPABASE_URL } from "./test.utils"
 
 interface TestRow {
   active: boolean
@@ -33,7 +26,9 @@ const makeRows = (count: number): TestRow[] =>
 // Parses `order` and simple top-level `col=eq.value` filters with the same
 // typing PostgREST would use, then slices by offset/limit (capped at the
 // simulated server row cap) and reports `Content-Range` for the filtered
-// total, matching what a real `count=exact` request returns.
+// total, matching what a real `count=exact` request returns. A request with no
+// `limit` param is served the whole page the server would return — up to the
+// row cap — exactly as PostgREST does when the client sends no limit.
 
 const RESERVED_PARAMS = new Set(["select", "order", "limit", "offset"])
 
@@ -159,6 +154,8 @@ const createPagedFetch = <T extends Row>(
 
     const total = filtered.length
     const offset = Number(params.get("offset") ?? 0)
+    // No `limit` param means the client left the page size to the server, which
+    // still caps the response at `maxRows`.
     const requestedLimit = Number(params.get("limit") ?? maxRows)
     const limit = Math.min(requestedLimit, maxRows)
     const page = filtered.slice(offset, offset + limit)
@@ -182,22 +179,15 @@ const createPagedFetch = <T extends Row>(
 const runQuery = (
   supabase: SupabaseClient,
   loadSubsetOptions: LoadSubsetOptions = {},
-  pageSize?: number,
   keys = ["id"],
   signal: AbortSignal = new AbortController().signal
 ) =>
-  supabaseQueryFn(
-    supabase,
-    "users",
-    keys,
-    {
-      client: {} as never,
-      queryKey: ["users"],
-      signal,
-      meta: { loadSubsetOptions },
-    },
-    pageSize
-  )
+  supabaseQueryFn(supabase, "users", keys, {
+    client: {} as never,
+    queryKey: ["users"],
+    signal,
+    meta: { loadSubsetOptions },
+  })
 
 const sort = (column: string, direction: "asc" | "desc" = "asc") => ({
   expression: new IR.PropRef([column]),
@@ -213,7 +203,7 @@ const supabaseWithFetch = (mockFetch: typeof fetch) =>
   createClient(SUPABASE_URL, SUPABASE_KEY, { global: { fetch: mockFetch } })
 
 describe("collection query pagination", () => {
-  test("continues past a server cap lower than pageSize", async () => {
+  test("pages by the server row cap when no limit is requested", async () => {
     const expected = makeRows(3000)
     const mockFetch = createPagedFetch(expected, { maxRows: 500 })
     const supabase = supabaseWithFetch(mockFetch)
@@ -222,13 +212,13 @@ describe("collection query pagination", () => {
 
     expect(rows).toEqual(expected)
     expect(mockFetch).toHaveBeenCalledTimes(6)
+    // No `limit` param is ever sent; the server's max-rows setting alone sizes
+    // each page.
     for (const [url] of mockFetch.mock.calls) {
-      expect(new URL(String(url)).searchParams.get("limit")).toBe("1000")
+      expect(new URL(String(url)).searchParams.has("limit")).toBe(false)
     }
-    // Regression test: the server cap (500) is below pageSize (1000), so each
-    // page only returns 500 rows. The offset must advance by rows actually
-    // received, not by the requested limit, or the next page would skip 500
-    // rows every time.
+    // Each page returns 500 rows (the cap), so the offset must advance by rows
+    // actually received or the next page would skip rows.
     expect(
       mockFetch.mock.calls.map(([url]) =>
         new URL(String(url)).searchParams.get("offset")
@@ -236,53 +226,38 @@ describe("collection query pagination", () => {
     ).toEqual([null, "500", "1000", "1500", "2000", "2500"])
   })
 
-  test("does not change behavior when the server cap exceeds pageSize (no-op)", async () => {
-    const expected = makeRows(3501)
-    const mockFetch = createPagedFetch(expected, { maxRows: 2000 })
+  test("stops without an extra request when the count is an exact multiple of the cap", async () => {
+    const expected = makeRows(2000)
+    const mockFetch = createPagedFetch(expected, { maxRows: 1000 })
     const supabase = supabaseWithFetch(mockFetch)
 
     const rows = await runQuery(supabase)
 
     expect(rows).toEqual(expected)
-    expect(mockFetch).toHaveBeenCalledTimes(4)
-    for (const [url] of mockFetch.mock.calls) {
-      expect(new URL(String(url)).searchParams.get("limit")).toBe("1000")
-    }
+    expect(mockFetch).toHaveBeenCalledTimes(2)
+    expect(
+      mockFetch.mock.calls.map(([url]) =>
+        new URL(String(url)).searchParams.get("offset")
+      )
+    ).toEqual([null, "1000"])
   })
 
-  test("stops without an extra request when the row count is an exact multiple of pageSize", async () => {
-    const expected = makeRows(2000)
-    const mockFetch = createPagedFetch(expected)
+  test("loads only the first server page when no count header is returned", async () => {
+    // Without a count and without a caller limit there is no signal that more
+    // rows remain, so the loop cannot safely advance the offset — it treats the
+    // single server page as complete. (A real PostgREST always reports the range
+    // under `count=exact`, so this is only a defensive fallback.)
+    const expected = makeRows(3000)
+    const mockFetch = createPagedFetch(expected, {
+      maxRows: 500,
+      omitCount: true,
+    })
     const supabase = supabaseWithFetch(mockFetch)
 
-    const rows = await runQuery(supabase, {}, 1000)
+    const rows = await runQuery(supabase)
 
-    expect(rows).toEqual(expected)
-    expect(mockFetch).toHaveBeenCalledTimes(2)
-  })
-
-  describe("falls back to an under-full page when the server reports no count", () => {
-    test("stops on the first under-full page", async () => {
-      const expected = makeRows(3)
-      const mockFetch = createPagedFetch(expected, { omitCount: true })
-      const supabase = supabaseWithFetch(mockFetch)
-
-      const rows = await runQuery(supabase, {}, 2)
-
-      expect(rows).toEqual(expected)
-      expect(mockFetch).toHaveBeenCalledTimes(2)
-    })
-
-    test("issues a trailing empty request for an exact multiple", async () => {
-      const expected = makeRows(4)
-      const mockFetch = createPagedFetch(expected, { omitCount: true })
-      const supabase = supabaseWithFetch(mockFetch)
-
-      const rows = await runQuery(supabase, {}, 2)
-
-      expect(rows).toEqual(expected)
-      expect(mockFetch).toHaveBeenCalledTimes(3)
-    })
+    expect(rows).toHaveLength(500)
+    expect(mockFetch).toHaveBeenCalledTimes(1)
   })
 
   test.each([
@@ -312,10 +287,10 @@ describe("collection query pagination", () => {
     orderBy,
     expected,
   }) => {
-    const mockFetch = createPagedFetch(makeRows(5))
+    const mockFetch = createPagedFetch(makeRows(5), { maxRows: 2 })
     const supabase = supabaseWithFetch(mockFetch)
 
-    await runQuery(supabase, { orderBy }, 2, keys)
+    await runQuery(supabase, { orderBy }, keys)
 
     expect(mockFetch).toHaveBeenCalledTimes(3)
     for (const [url] of mockFetch.mock.calls) {
@@ -323,8 +298,8 @@ describe("collection query pagination", () => {
     }
   })
 
-  test("fetches all rows across multiple PostgREST pages", async () => {
-    const mockFetch = createPagedFetch(makeRows(2501))
+  test("fetches all rows across multiple server pages", async () => {
+    const mockFetch = createPagedFetch(makeRows(2501), { maxRows: 1000 })
     const supabase = supabaseWithFetch(mockFetch)
 
     const rows = await runQuery(supabase)
@@ -332,28 +307,30 @@ describe("collection query pagination", () => {
     expect(rows).toHaveLength(2501)
     expect(mockFetch.mock.calls.map(([url]) => normalizeFetchUrl(url))).toEqual(
       [
-        "/rest/v1/users?limit=1000&order=id.asc&select=*",
-        "/rest/v1/users?limit=1000&offset=1000&order=id.asc&select=*",
-        "/rest/v1/users?limit=1000&offset=2000&order=id.asc&select=*",
+        "/rest/v1/users?order=id.asc&select=*",
+        "/rest/v1/users?offset=1000&order=id.asc&select=*",
+        "/rest/v1/users?offset=2000&order=id.asc&select=*",
       ]
     )
   })
 
-  test("preserves filters, ordering, limits, and offsets on every page", async () => {
-    const mockFetch = createPagedFetch(makeRows(12))
+  test("preserves filters, ordering, the caller limit, and offsets on every page", async () => {
+    const mockFetch = createPagedFetch(makeRows(12), { maxRows: 2 })
     const supabase = supabaseWithFetch(mockFetch)
 
-    const rows = await runQuery(
-      supabase,
-      { ...queryOptions(), limit: 5, offset: 3 },
-      2
-    )
+    const rows = await runQuery(supabase, {
+      ...queryOptions(),
+      limit: 5,
+      offset: 3,
+    })
 
     expect(rows.map(({ id }) => id)).toEqual([3, 4, 5, 6, 7])
+    // The caller's remaining limit rides on every page; the offset advances by
+    // rows received so the server cap does not leave a gap.
     expect(mockFetch.mock.calls.map(([url]) => normalizeFetchUrl(url))).toEqual(
       [
-        "/rest/v1/users?active=eq.true&limit=2&offset=3&order=id.asc&select=*",
-        "/rest/v1/users?active=eq.true&limit=2&offset=5&order=id.asc&select=*",
+        "/rest/v1/users?active=eq.true&limit=5&offset=3&order=id.asc&select=*",
+        "/rest/v1/users?active=eq.true&limit=3&offset=5&order=id.asc&select=*",
         "/rest/v1/users?active=eq.true&limit=1&offset=7&order=id.asc&select=*",
       ]
     )
@@ -363,7 +340,7 @@ describe("collection query pagination", () => {
     const mockFetch = createPagedFetch(makeRows(3), { maxRows: 2 })
     const supabase = supabaseWithFetch(mockFetch)
 
-    const rows = await runQuery(supabase, {}, 2)
+    const rows = await runQuery(supabase)
 
     expect(rows).toHaveLength(3)
     expect(mockFetch).toHaveBeenCalledTimes(2)
@@ -373,27 +350,40 @@ describe("collection query pagination", () => {
     const mockFetch = createPagedFetch(makeRows(8), { maxRows: 2 })
     const supabase = supabaseWithFetch(mockFetch)
 
-    const rows = await runQuery(supabase, { limit: 4 }, 2)
+    const rows = await runQuery(supabase, { limit: 4 })
 
     expect(rows).toHaveLength(4)
     expect(mockFetch).toHaveBeenCalledTimes(2)
+  })
+
+  test("stops on an under-full page under an explicit limit with no count", async () => {
+    const mockFetch = createPagedFetch(makeRows(3), {
+      maxRows: 10,
+      omitCount: true,
+    })
+    const supabase = supabaseWithFetch(mockFetch)
+
+    const rows = await runQuery(supabase, { limit: 4 })
+
+    expect(rows).toHaveLength(3)
+    expect(mockFetch).toHaveBeenCalledTimes(1)
   })
 
   test("returns no rows and makes no request for limit 0", async () => {
     const mockFetch = createPagedFetch(makeRows(8))
     const supabase = supabaseWithFetch(mockFetch)
 
-    const rows = await runQuery(supabase, { limit: 0 }, 2)
+    const rows = await runQuery(supabase, { limit: 0 })
 
     expect(rows).toEqual([])
     expect(mockFetch).not.toHaveBeenCalled()
   })
 
   test("sends Prefer: count=exact on every page", async () => {
-    const mockFetch = createPagedFetch(makeRows(5))
+    const mockFetch = createPagedFetch(makeRows(5), { maxRows: 2 })
     const supabase = supabaseWithFetch(mockFetch)
 
-    await runQuery(supabase, {}, 2)
+    await runQuery(supabase)
 
     expect(mockFetch.mock.calls.length).toBeGreaterThan(0)
     for (const [, init] of mockFetch.mock.calls) {
@@ -407,6 +397,7 @@ describe("collection query pagination", () => {
   test("stops issuing requests once the signal is aborted", async () => {
     const controller = new AbortController()
     const mockFetch = createPagedFetch(makeRows(10), {
+      maxRows: 2,
       onRequest: (index) => {
         if (index === 0) controller.abort()
       },
@@ -414,57 +405,21 @@ describe("collection query pagination", () => {
     const supabase = supabaseWithFetch(mockFetch)
 
     await expect(
-      runQuery(supabase, {}, 2, ["id"], controller.signal)
+      runQuery(supabase, {}, ["id"], controller.signal)
     ).rejects.toBeTruthy()
     expect(mockFetch).toHaveBeenCalledTimes(1)
   })
 
   test("fails the complete load when a later page errors", async () => {
-    const mockFetch = createPagedFetch(makeRows(5), { errorOnRequest: 1 })
+    const mockFetch = createPagedFetch(makeRows(5), {
+      maxRows: 2,
+      errorOnRequest: 1,
+    })
     const supabase = supabaseWithFetch(mockFetch)
 
-    await expect(runQuery(supabase, {}, 2)).rejects.toMatchObject({
+    await expect(runQuery(supabase)).rejects.toMatchObject({
       message: "page failed",
     })
     expect(mockFetch).toHaveBeenCalledTimes(2)
-  })
-})
-
-describe("pageSize validation", () => {
-  test.each([
-    0,
-    -1,
-    1.5,
-    Number.NaN,
-  ])("throws for an invalid pageSize (%s)", (pageSize) => {
-    const supabase = createClient(SUPABASE_URL, SUPABASE_KEY)
-    expect(() =>
-      supabaseCollectionOptions({
-        tableName: "users",
-        keys: ["id"],
-        schema: usersSchema,
-        supabase,
-        queryClient: new QueryClient(),
-        pageSize,
-      })
-    ).toThrow(/pageSize must be a positive integer/)
-  })
-
-  // `undefined` and `null` both fall back to the default page size.
-  test.each([
-    undefined,
-    null,
-  ])("uses the default when pageSize is %s", (pageSize) => {
-    const supabase = createClient(SUPABASE_URL, SUPABASE_KEY)
-    expect(() =>
-      supabaseCollectionOptions({
-        tableName: "users",
-        keys: ["id"],
-        schema: usersSchema,
-        supabase,
-        queryClient: new QueryClient(),
-        pageSize: pageSize as unknown as number,
-      })
-    ).not.toThrow()
   })
 })

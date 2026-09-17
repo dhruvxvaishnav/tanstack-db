@@ -17,8 +17,6 @@ import { appendLimit, appendOffset } from "./postgrest-filters/common"
 import { postgrestRequest } from "./postgrest-request"
 import { isSynced } from "./realtime"
 
-export const DEFAULT_PAGE_SIZE = 1000
-
 export const subsetOptionsToQueryKey = (
   tableName: string,
   ctx: LoadSubsetOptions
@@ -66,16 +64,21 @@ interface PageLoopOptions {
 }
 
 /**
- * Fetch every row `search` matches (or the first `limit` of them) in pages of
- * at most `pageSize` rows.
+ * Fetch every row `search` matches (or the first `limit` of them).
  *
- * Pages are addressed by offset, advanced by the number of rows actually
- * received. The loop stops using the row count PostgREST returns with every
- * page rather than an under-full page, because a response shorter than
- * requested can also mean the project's max-rows setting is below `pageSize`;
- * in that case the next page simply continues from the last row received.
- * Should a server not report a count, an under-full page is treated as the
- * last one.
+ * No page-size limit is sent. Each request lets the server return as many rows
+ * as its own max-rows setting allows, then the `Content-Range` count PostgREST
+ * reports (via `Prefer: count=exact`) tells us whether more rows remain. If so,
+ * the offset advances by the number of rows actually received and the next
+ * request continues from there — rinse and repeat until the offset reaches the
+ * total. When the caller sets its own `limit`, that limit is forwarded and the
+ * loop also stops once enough rows are collected.
+ *
+ * Fallbacks when no count header comes back: with a caller `limit`, an
+ * under-full page is treated as the last one; without a caller `limit`, the
+ * server is assumed to have returned every matching row in this single page,
+ * since blindly advancing the offset with no total to check against risks
+ * looping forever.
  *
  * Known limitation: a row deleted by another client between two page requests
  * shifts the remaining rows one offset back, so the first row of the next page
@@ -86,7 +89,6 @@ const fetchPages = async (
   tableName: string,
   search: URLSearchParams,
   { limit, offset = 0 }: PageLoopOptions,
-  pageSize: number,
   signal: AbortSignal
 ): Promise<Row[]> => {
   const rows: Row[] = []
@@ -96,9 +98,12 @@ const fetchPages = async (
     signal.throwIfAborted()
 
     const pageSearch = new URLSearchParams(search)
-    const remaining = limit === undefined ? pageSize : limit - rows.length
-    const requested = Math.min(pageSize, remaining)
-    appendLimit(pageSearch, requested)
+    // Only the caller's own limit is ever sent; the loop never adds one of its
+    // own, so each page is capped solely by the server's max-rows setting.
+    const requested = limit === undefined ? undefined : limit - rows.length
+    if (requested !== undefined) {
+      appendLimit(pageSearch, requested)
+    }
     if (pageOffset) {
       appendOffset(pageSearch, pageOffset)
     }
@@ -119,10 +124,16 @@ const fetchPages = async (
 
     // The count covers every matching row, including the ones skipped by the
     // offset. Advance by what was received, not what was requested, so a
-    // server cap below `pageSize` does not leave a gap.
+    // server cap below the caller's limit does not leave a gap.
     pageOffset += page.length
-    const complete =
-      count === null ? page.length < requested : pageOffset >= count
+    let complete: boolean
+    if (count !== null) {
+      complete = pageOffset >= count
+    } else if (requested !== undefined) {
+      complete = page.length < requested
+    } else {
+      complete = true
+    }
     if (complete) {
       break
     }
@@ -147,8 +158,7 @@ export const supabaseQueryFn = async (
     meta: QueryMeta | undefined
     pageParam?: unknown
     direction?: unknown
-  },
-  pageSize = DEFAULT_PAGE_SIZE
+  }
 ): Promise<any[]> => {
   const options: LoadSubsetOptions = ctx.meta?.loadSubsetOptions ?? {}
   const search = loadSubsetOptionsToSearch(options, keys)
@@ -172,14 +182,13 @@ export const supabaseQueryFn = async (
   const tiesSearch = cursorCurrentToSearch(options, keys)
   const [ties, rows] = await Promise.all([
     tiesSearch
-      ? fetchPages(supabase, tableName, tiesSearch, {}, pageSize, ctx.signal)
+      ? fetchPages(supabase, tableName, tiesSearch, {}, ctx.signal)
       : [],
     fetchPages(
       supabase,
       tableName,
       search,
       { limit: options.limit, offset },
-      pageSize,
       ctx.signal
     ),
   ])

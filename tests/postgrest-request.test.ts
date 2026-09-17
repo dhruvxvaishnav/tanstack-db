@@ -77,8 +77,9 @@ describe("cursor pagination fetches boundary ties", () => {
     const ties = urls.find((s) => s.get("id") === "eq.40")
     const keyset = urls.find((s) => s.get("id") === "gt.40")
 
-    // The tie read is paged by pageSize, never capped by the caller's limit.
-    expect(ties?.get("limit")).toBe("1000")
+    // The tie read sends no limit at all — it must load every row at the
+    // boundary, never capped by the caller's limit.
+    expect(ties?.has("limit")).toBe(false)
     expect(keyset?.get("limit")).toBe("20")
     // Cursor pins the window; offset must never ride alongside it.
     expect(keyset?.has("offset")).toBe(false)

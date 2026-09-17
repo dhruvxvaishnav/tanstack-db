@@ -131,7 +131,6 @@ const todos = createCollection(
 | `schema`      | `StandardSchemaV1` | Yes      | Schema for a single row. Supports any [Standard Schema](https://standardschema.dev)-compatible library, including Zod and Valibot. |
 | `keys`        | `string[]`         | Yes      | Column or columns that uniquely identify a row. Should match the primary key(s) on your table.                            |
 | `supabase`    | `SupabaseClient`   | Yes      | Supabase client instance used for queries, mutations, and the Realtime subscription.                                   |
-| `pageSize`    | `number`           | No       | Maximum rows requested per page. Must be a positive integer; `supabaseCollectionOptions` validates this and throws otherwise. Defaults to `1000`. A lower row limit on your project's API is handled automatically. |
 | `realtime`    | `boolean`          | No       | When `true`, subscribes to Postgres changes and reconciles inserts, updates, and deletes into the collection. Defaults to `false`. |
 | `realtimeUseFilter` | `boolean`    | No       | **Experimental.** Only applies when `realtime` is `true`. When `true`, each active query's `WHERE` clause is pushed to the Realtime subscription as a `postgres_changes` filter, so the channel only receives changes those queries care about. Defaults to `false`, which subscribes to every change on the table and filters client-side — simpler, at the cost of more Realtime traffic. Queries whose `WHERE` cannot be expressed as a Realtime filter (e.g. `or(...)`) transparently fall back to the unfiltered subscription. |
 | `queryClient` | `QueryClient`      | No       | TanStack Query client. If omitted, a shared global client is used.                                                     |
@@ -141,43 +140,30 @@ const todos = createCollection(
 #### Pagination
 
 Collection reads fetch every row matching a query (or the first `limit` rows,
-if one is set) in pages of at most `pageSize`. Every page request asks
-PostgREST for the exact matching row count (`Prefer: count=exact`), and the
-loop continues until that count has been received rather than stopping as soon
-as a page comes back shorter than requested. This distinction matters because
-a project's API settings can cap the rows PostgREST returns per request below
-`pageSize`; when that happens each page is smaller than asked for, but the
-count still lets the next page continue correctly from the last row received
-instead of being mistaken for the final page. The tradeoff is one extra count
-computed by Postgres per page request.
+if one is set) automatically, with no page-size setting to configure. Requests
+never send a page limit of their own: each one lets PostgREST return as many
+rows as your project's API max-rows setting allows, so that setting alone sizes
+each page. Every request asks PostgREST for the exact matching row count
+(`Prefer: count=exact`); when the count shows more rows remain, the next request
+continues from the last row received, and so on until the whole result has been
+loaded. The tradeoff is one extra count computed by Postgres per request.
 
 Pages after the first are addressed by offset, advanced by the number of rows
-actually received rather than the number requested, so a server row cap below
-`pageSize` does not cause the next page to skip or repeat rows. The requested
-sort order is used as-is, with any `keys` columns missing from it appended as
-tie-breakers, so the order is total and pages do not overlap. Known
-limitation: a row deleted by another client between two page requests shifts
-the remaining rows back by one offset, so one row can be missed until the
-query refetches.
+actually received, so the server's row cap never causes the next page to skip or
+repeat rows. The requested sort order is used as-is, with any `keys` columns
+missing from it appended as tie-breakers, so the order is total and pages do not
+overlap. Known limitation: a row deleted by another client between two page
+requests shifts the remaining rows back by one offset, so one row can be missed
+until the query refetches.
 
 Filters, ordering, limits, offsets, and cursor filters apply to every page. A
 failure on any page fails the complete collection load instead of returning
 partial data, and cancelling or superseding the query stops further page
 requests from being issued.
 
-Configure a smaller `pageSize` to bound the size of each individual request:
-a lower server row cap is handled automatically, so `pageSize` does not need
-to match it.
-
-```ts
-supabaseCollectionOptions({
-  tableName: "todos",
-  schema: todosSchema,
-  keys: ["id"],
-  supabase,
-  pageSize: 500,
-})
-```
+To bound how many rows each page returns, lower the max-rows setting on your
+project's API (PostgREST's `db-max-rows`); the pagination loop adapts to
+whatever the server returns.
 
 Loading thousands of rows into a browser increases network, memory, and parsing
 costs. Prefer selective filters or an explicit query limit when the UI does not

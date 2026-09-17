@@ -62,8 +62,11 @@ test("pushes a WHERE filter down to PostgREST", async ({ users }) => {
 test("pagination retrieves each row once when the requested sort has ties", async ({
   other,
 }) => {
+  // More rows than the server's max-rows cap so the offset loop pages for real,
+  // all sharing an `active` value so the sort's leading column is one big tie
+  // class straddling every page boundary.
   const { error } = await other.from("users").insert(
-    Array.from({ length: 20 }, (_, index) => ({
+    Array.from({ length: 1001 }, (_, index) => ({
       active: true,
       email: `tied-pagination-${index}@test.com`,
       name: "Same name",
@@ -80,29 +83,23 @@ test("pagination retrieves each row once when the requested sort has ties", asyn
 
   const queryClient = new QueryClient()
   try {
-    const rows = await supabaseQueryFn(
-      other,
-      "users",
-      ["id"],
-      {
-        client: queryClient,
-        queryKey: ["users"],
-        signal: new AbortController().signal,
-        meta: {
-          loadSubsetOptions: {
-            orderBy: [
-              {
-                expression: new IR.PropRef(["active"]),
-                compareOptions: { direction: "desc", nulls: "last" },
-              },
-            ],
-          },
+    const rows = await supabaseQueryFn(other, "users", ["id"], {
+      client: queryClient,
+      queryKey: ["users"],
+      signal: new AbortController().signal,
+      meta: {
+        loadSubsetOptions: {
+          orderBy: [
+            {
+              expression: new IR.PropRef(["active"]),
+              compareOptions: { direction: "desc", nulls: "last" },
+            },
+          ],
         },
       },
-      2
-    )
+    })
 
-    expect(rows).toHaveLength(22)
+    expect(rows).toHaveLength(1003)
     expect(rows).toEqual(expected)
   } finally {
     queryClient.clear()
